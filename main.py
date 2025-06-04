@@ -1,94 +1,141 @@
+"""
+Jazz-Album micro-API
+────────────────────
+• GET /album?album=Kind%20of%20Blue&artist=Miles%20Davis
+  → JSON with artist facts, catalogue no., personnel, cover URL, etc.
+
+Designed for the Penguin-Jazz-Guide GPT hosted at
+https://jazz-api-oulu.onrender.com
+"""
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from typing import List, Dict
 import httpx, os, asyncio
+from urllib.parse import quote
 
+# ── FastAPI app ──────────────────────────────────────────────────────────
 app = FastAPI(
     title="Jazz Album Profile",
     version="1.0.0",
-    servers=[{"url": "https://jazz-api-oulu.onrender.com"}]  # ← keep your URL
+    servers=[{"url": "https://jazz-api-oulu.onrender.com"}],  # ← Render URL
 )
 
-# ── data model ───────────────────────────────────────────────────────────
-
+# ── response schema ──────────────────────────────────────────────────────
 class Profile(BaseModel):
-    artist: dict      # {name, born, died}
-    album: dict       # {title, year, catalogue}
-    personnel: list[str]
-    quotes: list[str]
+    artist: Dict[str, str]        # name, born, died, area
+    album: Dict[str, str]         # title, year, catalogue
+    personnel: List[str]
+    quotes: List[str]
     cover_url: str
     long_text: str
 
-# ── external APIs ────────────────────────────────────────────────────────
+# ── constants ────────────────────────────────────────────────────────────
 MUSICBRAINZ = "https://musicbrainz.org/ws/2"
 DISCOGS     = "https://api.discogs.com"
-DC_TOKEN    = os.getenv("DISCOGS_TOKEN")
+DC_TOKEN    = os.getenv("DISCOGS_TOKEN", "")
 
-async def mb_release(album, artist):
-    q   = f'release:"{album}" AND artist:"{artist}"'
-    url = f"{MUSICBRAINZ}/release/?query={q}&fmt=json&limit=1"
+# ── helpers ──────────────────────────────────────────────────────────────
+async def cover_from_caa(release_group_id: str) -> str:
+    """Return a 500-px front cover from Cover Art Archive if available."""
+    url = f"https://coverartarchive.org/release-group/{release_group_id}/front-500"
     async with httpx.AsyncClient() as c:
-        return (await c.get(url, timeout=15)).json()["releases"][0]
+        resp = await c.get(url, timeout=10)
+    return url if resp.status_code == 200 else ""
 
-# ★ 1  look up artist birth/death via MusicBrainz -------------------------
-async def mb_artist_dates(artist_id):
-    url = f"{MUSICBRAINZ}/artist/{artist_id}?fmt=json&inc=aliases"
+def spotify_search_link(text: str) -> str:
+    """Generate an all-regions Spotify search link."""
+    return f"https://open.spotify.com/search/{quote(text)}"
+
+# ── MusicBrainz calls ────────────────────────────────────────────────────
+async def mb_release(album: str, artist: str) -> dict:
+    """Return first matching release incl. nested release-group & label info."""
+    q   = f'release:"{album}" AND artist:"{artist}"'
+    url = f"{MUSICBRAINZ}/release/?query={q}&fmt=json&limit=1&inc=release-groups+labels"
+    async with httpx.AsyncClient() as c:
+        data = (await c.get(url, timeout=15)).json()
+    if not data.get("releases"):
+        raise ValueError("No MB release")
+    return data["releases"][0]
+
+async def mb_artist_dates(artist_id: str) -> dict:
+    url = f"{MUSICBRAINZ}/artist/{artist_id}?fmt=json&inc=area"
     async with httpx.AsyncClient() as c:
         data = (await c.get(url, timeout=15)).json()
     life = data.get("life-span", {})
     return {
         "born": life.get("begin", ""),
         "died": life.get("end", ""),
-        "area": (data.get("area") or {}).get("name", "")
+        "area": (data.get("area") or {}).get("name", ""),
     }
 
-# ★ 2  find correct Discogs master id first, THEN fetch personnel ----------
-async def discogs_master(album, artist):
-    async with httpx.AsyncClient() as c:
-        # search
-        s_url = f"{DISCOGS}/database/search"
-        params = {
-            "q": f"{album} {artist}",
-            "type": "master",
-            "per_page": 1,
-            "token": DC_TOKEN
-        }
-        search = (await c.get(s_url, params=params, timeout=15)).json()
+# ── Discogs calls ────────────────────────────────────────────────────────
+async def discogs_master(album: str, artist: str) -> dict:
+    """Search Discogs for a master entry, then return full master JSON."""
+    headers = {"User-Agent": "penguin-jazz-guide/1.0"}
+    params  = {
+        "q": f"{album} {artist}",
+        "type": "master",
+        "per_page": 1,
+        "token": DC_TOKEN,
+    }
+    async with httpx.AsyncClient(headers=headers) as c:
+        search = (await c.get(f"{DISCOGS}/database/search", params=params, timeout=15)).json()
         master_id = search["results"][0]["id"]
-        # master detail
-        m_url = f"{DISCOGS}/masters/{master_id}"
-        return (await c.get(m_url, timeout=15)).json()
+        master    = (await c.get(f"{DISCOGS}/masters/{master_id}", timeout=15)).json()
+    return master
 
-# ── route ────────────────────────────────────────────────────────────────
+# ── API route ────────────────────────────────────────────────────────────
 @app.get("/album", response_model=Profile)
 async def album(album: str, artist: str):
     try:
-        mb  = await mb_release(album, artist)
+        mb_release_data = await mb_release(album, artist)
     except Exception:
-        raise HTTPException(404, "Album not found")
+        raise HTTPException(404, "Album not found in MusicBrainz")
 
-    # gather in parallel
-    artist_task   = asyncio.create_task(mb_artist_dates(mb["artist-credit"][0]["artist"]["id"]))
-    discogs_task  = asyncio.create_task(discogs_master(album, artist))
-    artist_info   = await artist_task
-    disc          = await discogs_task
+    # fetch artist dates + discogs master in parallel
+    artist_mbid = mb_release_data["artist-credit"][0]["artist"]["id"]
+    artist_task  = asyncio.create_task(mb_artist_dates(artist_mbid))
+    discogs_task = asyncio.create_task(discogs_master(album, artist))
 
-    # common helpers
+    artist_info = await artist_task
+    disc        = await discogs_task
+
+    # year: prioritise release-group first-release-date
+    year = (
+        (mb_release_data.get("release-group") or {}).get("first-release-date", "")[:4]
+        or mb_release_data.get("date", "")[:4]
+    )
+
+    # catalogue number (if MusicBrainz has one)
     catno = ""
-    if mb.get("label-info"):
-        catno = mb["label-info"][0].get("catalog-number", "")
-    # personnel list
-    personnel = [
-        f'{p["name"]} — {p.get("role","")}'
-        for p in disc.get("extraartists", [])
-    ] or [m.get("name") for m in disc.get("artists", [])]
+    if mb_release_data.get("label-info"):
+        catno = mb_release_data["label-info"][0].get("catalog-number", "")
 
-    # cover art
+    # personnel: combine main artists + extra artists from Discogs
+    personnel = [
+        f'{p["name"]} — {p.get("role","").strip() or "primary"}'
+        for p in disc.get("artists", [])
+    ] + [
+        f'{p["name"]} — {p.get("role","").strip()}'
+        for p in disc.get("extraartists", [])
+    ]
+    if not personnel:
+        personnel = ["Personnel not listed"]
+
+    # cover art: Discogs primary image → fallback to Cover Art Archive
     cover = next(
         (img["uri"] for img in disc.get("images", []) if img.get("type") == "primary"),
         ""
     )
+    if not cover:
+        rg_id = (mb_release_data.get("release-group") or {}).get("id", "")
+        if rg_id:
+            cover = await cover_from_caa(rg_id)
 
-    # return
+    # long_text: short Discogs notes (max 2000 chars)
+    notes = " ".join(disc.get("notes", "").splitlines())[:2000]
+
     return Profile(
         artist={
             "name": artist,
@@ -98,11 +145,11 @@ async def album(album: str, artist: str):
         },
         album={
             "title": album,
-            "year": mb.get("date", "")[:4],
+            "year": year,
             "catalogue": catno,
         },
         personnel=personnel,
-        quotes=[],           # you can fill this later with a scraper
+        quotes=[],              # fill later with a quotes-scraper if desired
         cover_url=cover,
-        long_text=" ".join(disc.get("notes", "").splitlines())[:2000],
+        long_text=notes,
     )
