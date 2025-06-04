@@ -3,7 +3,12 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import httpx, os
 
-app = FastAPI(title="Jazz Album Profile", version="1.0.0")
+app = FastAPI(
+    title="Jazz Album Profile",
+    version="1.0.0",
+    servers=[{"url": "https://jazz-api-oulu.onrender.com"}]   
+)
+
 
 class Profile(BaseModel):
     artist: dict
