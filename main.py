@@ -16,6 +16,7 @@ class Profile(BaseModel):
     personnel: list[str]
     quotes: list[str]
     long_text: str
+    cover_url: str
 
 MUSICBRAINZ = "https://musicbrainz.org/ws/2"
 DISCOGS     = "https://api.discogs.com"
@@ -55,4 +56,8 @@ async def album(album: str, artist: str):
         ],
         quotes=[],
         long_text=" ".join(disc.get("notes", "").splitlines())[:2000],
+            cover_url = next(
+                (img["uri"] for img in disc.get("images", []) if img.get("type") == "primary"),
+                ""
+            )
     )
